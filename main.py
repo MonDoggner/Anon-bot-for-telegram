@@ -10,7 +10,7 @@ class MoscowTimeFormatter(logging.Formatter):
     """Форматтер логов с московским временем (UTC+3)."""
     def converter(self, timestamp):
         return (datetime.fromtimestamp(timestamp, timezone.utc) + timedelta(hours=3)).timetuple()
-
+    
 class AnonymousBot:
     def __init__(self, token: str, admin_id: int):
         self.bot = TeleBot(
@@ -108,53 +108,53 @@ class AnonymousBot:
             if content_type == 'text':
                 self.bot.send_message(self.admin_id, f"Анонимное сообщение: {content_data}")
             elif content_type == 'photo':
-                self.bot.send_photo(self.admin_id, content_data, caption=caption)
+                self.bot.send_photo(self.admin_id, content_data.file_id, caption=caption)
             elif content_type == 'document':
-                self.bot.send_document(self.admin_id, content_data, caption=caption)
+                self.bot.send_document(self.admin_id, content_data.file_id, caption=caption)
             elif content_type == 'voice':
-                self.bot.send_voice(self.admin_id, content_data, caption=caption)
+                self.bot.send_voice(self.admin_id, content_data.file_id, caption=caption)
             elif content_type == 'video':
-                self.bot.send_video(self.admin_id, content_data, caption=caption)
+                self.bot.send_video(self.admin_id, content_data.file_id, caption=caption)
             elif content_type == 'audio':
-                self.bot.send_audio(self.admin_id, content_data, caption=caption)
+                self.bot.send_audio(self.admin_id, content_data.file_id, caption=caption)
             elif content_type == 'sticker':
-                self.bot.send_sticker(self.admin_id, content_data)
+                self.bot.send_sticker(self.admin_id, content_data.file_id)
                 self.bot.send_message(self.admin_id, "Анонимный стикер")
             elif content_type == 'video_note':
-                self.bot.send_video_note(self.admin_id, content_data)
+                self.bot.send_video_note(self.admin_id, content_data.file_id)
             elif content_type == 'contact':
-                self.bot.send_contact(self.admin_id, content_data.phone_number, content_data.first_name)
+                self.bot.send_contact(
+                    self.admin_id,
+                    phone_number=content_data.phone_number,
+                    first_name=content_data.first_name
+                )
             elif content_type == 'location':
-                self.bot.send_location(self.admin_id, content_data.latitude, content_data.longitude)
+                self.bot.send_location(
+                    self.admin_id,
+                    latitude=content_data.latitude,
+                    longitude=content_data.longitude
+                )
             
             self.logger.info(f"Forwarded {content_type} to admin {self.admin_id}")
         except Exception as e:
             self.logger.error(f"Error sending {content_type} to admin: {e}")
 
     def _handle_user_message(self, message, content_type: str) -> None:
-        """Основной обработчик входящих сообщений."""
         if message.chat.id == self.admin_id:
             return
 
         try:
-            # 1. Отправка подтверждения пользователю
             self.bot.send_message(message.chat.id, Config.DEFAULT_ANSWER)
             
-            # 2. Подготовка данных для админа
             caption = getattr(message, 'caption', None) or "Без подписи"
             content_data = message.text if content_type == 'text' else getattr(message, content_type)
             
-            # 3. Формирование заголовка
             if content_type not in ['text', 'sticker', 'video_note']:
                 caption = f"Анонимное {content_type}\nПодпись: {caption}"
             
-            # 4. Пересылка админу
             self._send_to_admin(content_type, content_data, caption)
-            
-            # 5. Обновление статистики
             self.db.increment_user_sends(message.chat.id)
-            self.logger.info(f"Processed {content_type} from {message.chat.id}")
-
+            
         except Exception as e:
             self.logger.error(f"Error handling {content_type}: {e}")
 
