@@ -1,5 +1,4 @@
 /__pycache__
 /venv
-data.py
-old_main.py
+config.py
 bot.db

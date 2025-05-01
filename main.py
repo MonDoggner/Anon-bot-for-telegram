@@ -1,180 +1,177 @@
-import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ForceReply
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from data import TOKEN, GREETING, ADMIN_ID, DEFAULT_ANSWER
-from database_manager import DatabaseManager
+import time
+from datetime import datetime, timedelta, timezone
+from telebot import TeleBot
+from telebot.storage import StateMemoryStorage
+from config import Config
+from database import Database
 
-# Настройка логгера
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger('AnonBot')
+class MoscowTimeFormatter(logging.Formatter):
+    """Форматтер логов с московским временем (UTC+3)."""
+    def converter(self, timestamp):
+        return (datetime.fromtimestamp(timestamp, timezone.utc) + timedelta(hours=3)).timetuple()
 
-# Инициализация бота
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-db = DatabaseManager()
+class AnonymousBot:
+    def __init__(self, token: str, admin_id: int):
+        self.bot = TeleBot(
+            token,
+            state_storage=StateMemoryStorage(),
+            parse_mode=None,
+            threaded=True
+        )
+        self.admin_id = admin_id
+        self.db = Database()
+        self._setup_logging()
+        self._register_handlers()
 
-# Мидлварь для управления БД
-@dp.update.middleware
-async def db_middleware(handler, event, data):
-    await db.connect()
-    data["db"] = db
-    result = await handler(event, data)
-    await db.close()
-    return result
-
-# Клавиатура админ-панели
-async def admin_panel_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"),
-        InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")
-    )
-    builder.row(
-        InlineKeyboardButton(text="⬆️ Повысить уровень", callback_data="admin_promote")
-    )
-    return builder.as_markup()
-
-# Обработчик /start
-@dp.message(Command("start"))
-async def start_handler(message: Message, db: DatabaseManager):
-    try:
-        user_id = message.from_user.id
-        username = message.from_user.username or "Anonymous"
+    def _setup_logging(self) -> None:
+        """Настройка логирования с московским временем."""
+        logger = logging.getLogger('AnonymousBot')
+        logger.setLevel(logging.INFO)
         
-        # Регистрация пользователя
-        if not await db.get_user(user_id):
-            await db.insert(username, user_id)
-            logger.info(f"Новый пользователь: {username}")
-
-        # Проверка уровня доступа
-        user = await db.get_user(user_id)
-        keyboard = None
-        if user and user[3] == 2:  # user[3] = level
-            keyboard = await admin_panel_kb()
-
-        await message.answer(GREETING, reply_markup=keyboard)
-
-    except Exception as e:
-        logger.error(f'Ошибка: {e}')
-        await message.answer("⚠️ Ошибка, попробуйте позже")
-
-# Обработчик админ-действий
-@dp.callback_query(F.data.startswith("admin_"))
-async def admin_actions(callback: types.CallbackQuery, db: DatabaseManager):
-    user = await db.get_user(callback.from_user.id)
-    if not user or user[3] != 2:
-        await callback.answer("❌ Доступ запрещён!")
-        return
-
-    action = callback.data.split("_")[1]
-
-    if action == "stats":
-        users = await db.get_all_users()
-        stats = "\n".join([f"{u[1]}: {u[4]} сообщ." for u in users])
-        await callback.message.edit_text(
-            f"📊 Статистика:\n\n{stats}",
-            reply_markup=await admin_panel_kb()
+        formatter = MoscowTimeFormatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
         )
+        
+        # Консольный вывод
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+        
+        # Запись в файл (для PythonAnywhere)
+        fh = logging.FileHandler('bot.log')
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+        
+        self.logger = logger
 
-    elif action == "broadcast":
-        await callback.message.answer(
-            "Введите сообщение для рассылки:",
-            reply_markup=ForceReply(selective=True)
-        )
+    def _register_handlers(self) -> None:
+        """Регистрация всех обработчиков сообщений."""
+        
+        @self.bot.message_handler(commands=['start'])
+        def start(message):
+            self._handle_start(message)
 
-    elif action == "promote":
-        await callback.message.answer(
-            "Введите Telegram ID пользователя:",
-            reply_markup=ForceReply(selective=True)
-        )
+        @self.bot.message_handler(content_types=['text'])
+        def handle_text(message):
+            self._handle_user_message(message, 'text')
 
-# Обработчик ответов
-@dp.message(F.reply_to_message)
-async def handle_replies(message: Message, db: DatabaseManager):
-    admin = await db.get_user(message.from_user.id)
-    if not admin or admin[3] != 2:
-        return
+        @self.bot.message_handler(content_types=['photo'])
+        def handle_photo(message):
+            self._handle_user_message(message, 'photo')
 
-    reply_text = message.reply_to_message.text
+        @self.bot.message_handler(content_types=['document'])
+        def handle_document(message):
+            self._handle_user_message(message, 'document')
 
-    if "рассылк" in reply_text:
-        users = await db.get_users_by_level(1)
-        success = 0
-        for user in users:
-            try:
-                await bot.send_message(user[2], message.text)
-                success += 1
-            except:
-                pass
-        await message.answer(f"✅ Отправлено: {success}/{len(users)}")
+        @self.bot.message_handler(content_types=['voice'])
+        def handle_voice(message):
+            self._handle_user_message(message, 'voice')
 
-    elif "повышени" in reply_text:
+        @self.bot.message_handler(content_types=['video'])
+        def handle_video(message):
+            self._handle_user_message(message, 'video')
+
+        @self.bot.message_handler(content_types=['audio'])
+        def handle_audio(message):
+            self._handle_user_message(message, 'audio')
+
+        @self.bot.message_handler(content_types=['sticker'])
+        def handle_sticker(message):
+            self._handle_user_message(message, 'sticker')
+
+        @self.bot.message_handler(content_types=['video_note'])
+        def handle_video_note(message):
+            self._handle_user_message(message, 'video_note')
+
+        @self.bot.message_handler(content_types=['contact'])
+        def handle_contact(message):
+            self._handle_user_message(message, 'contact')
+
+        @self.bot.message_handler(content_types=['location'])
+        def handle_location(message):
+            self._handle_user_message(message, 'location')
+
+    def _handle_start(self, message) -> None:
+        """Обработка команды /start."""
         try:
-            tg_id = int(message.text)
-            target = await db.get_user(tg_id)
-            if target:
-                await db.update_user_level(tg_id, 2)
-                await message.answer(f"✅ Уровень {tg_id} повышен!")
-            else:
-                await message.answer("❌ Пользователь не найден")
-        except:
-            await message.answer("❌ Неверный ID")
+            self.bot.send_message(message.chat.id, Config.GREETING)
+            self.db.increment_user_sends(message.chat.id)
+            self.logger.info(f"User {message.chat.id} started the bot")
+        except Exception as e:
+            self.logger.error(f"Error in /start: {e}")
 
-# Обработчик сообщений
-@dp.message()
-async def handle_content(message: Message, db: DatabaseManager):
-    try:
-        if message.from_user.id == ADMIN_ID:
+    def _send_to_admin(self, content_type: str, content_data, caption: str = "") -> None:
+        """Универсальный метод отправки контента админу."""
+        try:
+            if content_type == 'text':
+                self.bot.send_message(self.admin_id, f"Анонимное сообщение: {content_data}")
+            elif content_type == 'photo':
+                self.bot.send_photo(self.admin_id, content_data, caption=caption)
+            elif content_type == 'document':
+                self.bot.send_document(self.admin_id, content_data, caption=caption)
+            elif content_type == 'voice':
+                self.bot.send_voice(self.admin_id, content_data, caption=caption)
+            elif content_type == 'video':
+                self.bot.send_video(self.admin_id, content_data, caption=caption)
+            elif content_type == 'audio':
+                self.bot.send_audio(self.admin_id, content_data, caption=caption)
+            elif content_type == 'sticker':
+                self.bot.send_sticker(self.admin_id, content_data)
+                self.bot.send_message(self.admin_id, "Анонимный стикер")
+            elif content_type == 'video_note':
+                self.bot.send_video_note(self.admin_id, content_data)
+            elif content_type == 'contact':
+                self.bot.send_contact(self.admin_id, content_data.phone_number, content_data.first_name)
+            elif content_type == 'location':
+                self.bot.send_location(self.admin_id, content_data.latitude, content_data.longitude)
+            
+            self.logger.info(f"Forwarded {content_type} to admin {self.admin_id}")
+        except Exception as e:
+            self.logger.error(f"Error sending {content_type} to admin: {e}")
+
+    def _handle_user_message(self, message, content_type: str) -> None:
+        """Основной обработчик входящих сообщений."""
+        if message.chat.id == self.admin_id:
             return
 
-        user = await db.get_user(message.from_user.id)
-        if not user:
-            await message.answer("❌ Сначала выполните /start")
-            return
+        try:
+            # 1. Отправка подтверждения пользователю
+            self.bot.send_message(message.chat.id, Config.DEFAULT_ANSWER)
+            
+            # 2. Подготовка данных для админа
+            caption = getattr(message, 'caption', None) or "Без подписи"
+            content_data = message.text if content_type == 'text' else getattr(message, content_type)
+            
+            # 3. Формирование заголовка
+            if content_type not in ['text', 'sticker', 'video_note']:
+                caption = f"Анонимное {content_type}\nПодпись: {caption}"
+            
+            # 4. Пересылка админу
+            self._send_to_admin(content_type, content_data, caption)
+            
+            # 5. Обновление статистики
+            self.db.increment_user_sends(message.chat.id)
+            self.logger.info(f"Processed {content_type} from {message.chat.id}")
 
-        # Учёт сообщений
-        await db.increment_message_count(message.from_user.id)
+        except Exception as e:
+            self.logger.error(f"Error handling {content_type}: {e}")
 
-        # Пересылка контента админу
-        if message.text:
-            await bot.send_message(ADMIN_ID, f"✉️ Аноним: {message.text}")
-        elif message.photo:
-            await bot.send_photo(
-                ADMIN_ID,
-                message.photo[-1].file_id,
-                caption=f"📸 Анонимное фото\n{message.caption or ''}"
-            )
-        elif message.video:  # Новый блок для видео
-            await bot.send_video(
-                ADMIN_ID,
-                message.video.file_id,
-                caption=f"🎥 Анонимное видео\n{message.caption or ''}"
-            )
+    def run(self) -> None:
+        """Запуск бота с автоматическим перезапуском при ошибках."""
+        self.logger.info("Starting bot...")
+        while True:
+            try:
+                self.bot.infinity_polling(
+                    timeout=60,
+                    long_polling_timeout=60,
+                    skip_pending=True
+                )
+            except Exception as e:
+                self.logger.error(f"Bot crashed: {e}. Restarting in 10s...")
+                time.sleep(10)
 
-        await message.answer(DEFAULT_ANSWER)
-
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-
-# Запуск бота
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
+if __name__ == '__main__':
+    bot = AnonymousBot(Config.TOKEN, Config.ADMIN_ID)
+    bot.run()
